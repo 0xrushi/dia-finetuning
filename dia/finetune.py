@@ -50,17 +50,71 @@ class TrainConfig:
     output_dir: Path = Path(".")
 
 
+import argparse
+import os
+from pathlib import Path
+
+import torch
+import torchaudio
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader, random_split
+
+import dac
+from .config import DiaConfig
+from .model import Dia
+from .layers import DiaModel
+from .audio import build_delay_indices, apply_audio_delay
+
+# … keep your TrainConfig, collate_fn, optimizer, train_step, eval_step, etc. …
+
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the Dia audio model")
-    parser.add_argument("--config", type=Path, default=Path("dia/config.json"), help="Path to DiaConfig JSON file.")
-    parser.add_argument("--dataset", type=str, default="Paradoxia/opendata-iisys-hui", help="HuggingFace dataset identifier.")
-    parser.add_argument("--hub_model", type=str, default="nari-labs/Dia-1.6B", help="HuggingFace hub model repository.")
-    parser.add_argument("--run_name", type=str, default=None, help="Name of the TensorBoard run.")
-    parser.add_argument("--output_dir", type=Path, default=None, help="Directory to save checkpoints.")
+    parser.add_argument("--config",    type=Path, default=Path("dia/config.json"))
+    parser.add_argument("--dataset",   type=str,  default="Paradoxia/opendata-iisys-hui",
+                        help="HuggingFace dataset name (if not using --csv_path).")
+    parser.add_argument("--hub_model", type=str,  default="nari-labs/Dia-1.6B")
+    parser.add_argument("--local_ckpt", type=str,  default=None)
+    parser.add_argument("--csv_path",  type=Path, default=None,
+                        help="Path to local CSV/TSV file with `audio|text` (if you want to train locally).")
+    parser.add_argument("--audio_root",type=Path, default=None,
+                        help="Root directory for local audio files (required if --csv_path is set).")
+    parser.add_argument("--run_name",  type=str,  default=None)
+    parser.add_argument("--output_dir",type=Path, default=None)
     return parser.parse_args()
 
 
-class DiaDataset(Dataset):
+class LocalDiaDataset(Dataset):
+    """Load from a local CSV (sep='|') + an audio folder."""
+    def __init__(self, csv_path: Path, audio_root: Path, config: DiaConfig, dac_model: dac.DAC):
+        self.df = pd.read_csv(csv_path, sep=r'\s*\|\s*', engine='python',
+                              names=['audio','text'])
+        self.audio_root = audio_root
+        self.config = config
+        self.dac_model = dac_model
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        text = row['text']
+        audio_path = self.audio_root / row['audio']
+        waveform, sr = torchaudio.load(audio_path)
+        if sr != 44100:
+            waveform = torchaudio.functional.resample(waveform, sr, 44100)
+        waveform = waveform.unsqueeze(0)
+        with torch.no_grad():
+            # preprocess + encode exactly as before
+            audio_tensor = self.dac_model.preprocess(
+                waveform, 44100
+            ).to(next(self.dac_model.parameters()).device)
+            _, encoded, *_ = self.dac_model.encode(audio_tensor, n_quantizers=None)
+            encoded = encoded.squeeze(0).transpose(0, 1)
+        return text, encoded, waveform
+
+
+class HFDiaDataset(Dataset):
+    """Wrap a HuggingFace `datasets.Dataset` that has `audio.array` & `text`."""
     def __init__(self, hf_dataset, config: DiaConfig, dac_model: dac.DAC):
         self.dataset = hf_dataset
         self.config = config
@@ -78,8 +132,10 @@ class DiaDataset(Dataset):
         if sr != 44100:
             waveform = torchaudio.functional.resample(waveform, sr, 44100)
         with torch.no_grad():
-            audio_tensor = self.dac_model.preprocess(waveform, 44100)
-            audio_tensor = audio_tensor.to(self.dac_model.device)
+            audio_tensor = (
+                self.dac_model.preprocess(waveform, 44100)
+                .to(next(self.dac_model.parameters()).device)
+            )
             _, encoded, *_ = self.dac_model.encode(audio_tensor, n_quantizers=None)
             encoded = encoded.squeeze(0).transpose(0, 1)
         return text, encoded, waveform
@@ -136,15 +192,15 @@ def collate_fn(batch, config: DiaConfig, device: torch.device):
     }
 
 
-def setup_loaders(hf_dataset, dia_cfg: DiaConfig, dac_model: dac.DAC, train_cfg: TrainConfig):
-    ds = DiaDataset(hf_dataset, dia_cfg, dac_model)
-    n_train = int(train_cfg.split_ratio * len(ds))
-    train_ds, val_ds = random_split(ds, [n_train, len(ds) - n_train])
+def setup_loaders(dataset: Dataset, dia_cfg: DiaConfig, train_cfg):
+    """Take any torch Dataset, split and collate."""
+    n_train = int(train_cfg.split_ratio * len(dataset))
+    train_ds, val_ds = random_split(dataset, [n_train, len(dataset) - n_train])
     coll = lambda b: collate_fn(b, dia_cfg, device)
-    return (
-        DataLoader(train_ds, batch_size=train_cfg.batch_size, shuffle=True, collate_fn=coll),
-        DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=coll),
-    )
+    train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size, shuffle=True, collate_fn=coll)
+    val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=coll)
+    return train_loader, val_loader
+
 
 
 def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
@@ -242,7 +298,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, hf_dataset, train_cfg: 
     train_cfg.output_dir.mkdir(parents=True, exist_ok=True)
     (train_cfg.runs_dir / train_cfg.run_name).mkdir(parents=True, exist_ok=True)
     model = model.to(device)
-    train_loader, val_loader = setup_loaders(hf_dataset, dia_cfg, dac_model, train_cfg)
+    train_loader, val_loader = setup_loaders(hf_dataset, dia_cfg, train_cfg)
     opt, sched = setup_optimizer_and_scheduler(model, train_loader, train_cfg)
     writer = SummaryWriter(train_cfg.runs_dir / train_cfg.run_name)
     model.train()
@@ -270,18 +326,37 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, hf_dataset, train_cfg: 
 
 def main():
     args = get_args()
-    dia_cfg = DiaConfig.load(args.config)
-    dac_model = dac.DAC.load(dac.utils.download())
+    dia_cfg   = DiaConfig.load(args.config)
+    dac_model = dac.DAC.load(dac.utils.download()).to(device)
+
+    # Decide between HF dataset vs local CSV + folder
+    if args.csv_path:
+        if not args.audio_root:
+            raise ValueError("`--audio_root` must be set when using `--csv_path`")
+        dataset = LocalDiaDataset(args.csv_path, args.audio_root, dia_cfg, dac_model)
+    else:
+        from datasets import load_dataset
+        hf_ds = load_dataset(args.dataset, split="train")
+        dataset = HFDiaDataset(hf_ds, dia_cfg, dac_model)
+    
+
     train_cfg = TrainConfig(
-        run_name=args.run_name if args.run_name else TrainConfig.run_name,
-        output_dir=args.output_dir if args.output_dir else TrainConfig.output_dir,
+        run_name   = args.run_name   or TrainConfig.run_name,
+        output_dir = args.output_dir or TrainConfig.output_dir,
     )
-    hf_ds = load_dataset(args.dataset, split="train")
-    ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
+
+    # Initialize model from hub
+    from huggingface_hub import hf_hub_download
+    if args.local_ckpt:
+        ckpt_file = args.local_ckpt
+    else:
+        ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
     model = DiaModel(dia_cfg)
     model.load_state_dict(torch.load(ckpt_file, map_location="cpu"))
-    dac_model.to(device)
-    train(model, dia_cfg, dac_model, hf_ds, train_cfg)
+    model.to(device)
+
+    # Run training
+    train(model, dia_cfg, dac_model, dataset, train_cfg)
 
 
 if __name__ == "__main__":
