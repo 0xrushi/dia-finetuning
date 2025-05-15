@@ -96,21 +96,28 @@ class LocalDiaDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        text = row['text']
-        audio_path = self.audio_root / row['audio']
-        waveform, sr = torchaudio.load(audio_path)
-        if sr != 44100:
-            waveform = torchaudio.functional.resample(waveform, sr, 44100)
-        waveform = waveform.unsqueeze(0)
-        with torch.no_grad():
-            # preprocess + encode exactly as before
-            audio_tensor = self.dac_model.preprocess(
-                waveform, 44100
-            ).to(next(self.dac_model.parameters()).device)
-            _, encoded, *_ = self.dac_model.encode(audio_tensor, n_quantizers=None)
-            encoded = encoded.squeeze(0).transpose(0, 1)
-        return text, encoded, waveform
+        try:
+            row = self.df.iloc[idx]
+            text = row['text']
+            audio_path = self.audio_root / row['audio']
+            waveform, sr = torchaudio.load(audio_path)
+            if sr != 44100:
+                waveform = torchaudio.functional.resample(waveform, sr, 44100)
+            waveform = waveform.unsqueeze(0)
+            with torch.no_grad():
+                # preprocess + encode exactly as before
+                audio_tensor = self.dac_model.preprocess(
+                    waveform, 44100
+                ).to(next(self.dac_model.parameters()).device)
+                _, encoded, *_ = self.dac_model.encode(audio_tensor, n_quantizers=None)
+                encoded = encoded.squeeze(0).transpose(0, 1)
+            return text, encoded, waveform
+        except Exception as e:
+            row = self.df.iloc[idx]
+            text = row['text']
+            audio_path = self.audio_root / row['audio']
+            logger.error(f"Error processing audio path {audio_path}: {e}")
+            return text, None, None
 
 
 class HFDiaDataset(Dataset):
@@ -143,7 +150,13 @@ class HFDiaDataset(Dataset):
 
 def collate_fn(batch, config: DiaConfig, device: torch.device):
     from torch.nn.functional import pad
-    texts, encodings, waveforms = zip(*batch)
+
+    # Filter out samples where encoding is None
+    valid_batch = [b for b in batch if b[1] is not None]
+    if not valid_batch:
+        logger.warning("All samples in the batch are invalid after filtering. Returning empty batch.")
+        return {}
+    texts, encodings, waveforms = zip(*valid_batch)
     # Text
     max_text = config.data.text_length
     pad_tok = config.data.text_pad_value
@@ -252,6 +265,9 @@ def eval_step(model, val_loader, dia_cfg, dac_model, writer, global_step):
     eval_losses = []
     last_batch = None
     for eb in tqdm(val_loader, desc="eval"):
+        if not eb:
+            logger.warning("Skipping empty batch during evaluation.")
+            continue
         last_batch = eb
         logits_eval = model(
             src_BxS=eb['src_tokens'],
@@ -274,22 +290,26 @@ def eval_step(model, val_loader, dia_cfg, dac_model, writer, global_step):
             loss_e += w * F.cross_entropy(lc, tc, ignore_index=dia_cfg.data.audio_pad_value)
         eval_losses.append(loss_e / sum(weights_e))
 
-    avg_eval_loss = sum(eval_losses) / len(eval_losses)
+    if not eval_losses:
+        logger.warning("No valid batches processed during evaluation. Skipping eval metrics.")
+        avg_eval_loss = 0.0 # Or float('nan') or handle as appropriate
+    else:
+        avg_eval_loss = sum(eval_losses) / len(eval_losses)
     writer.add_scalar('Loss/eval', avg_eval_loss, global_step)
 
     try:
-        
-        dia_gen = Dia(dia_cfg, device)
-        dia_gen.model, dia_gen.dac_model = model, dac_model
-        with autocast():
-            audio_no = dia_gen.generate(text=last_batch['raw_text'])
-            prompt_wave = last_batch['waveforms'][0][:, :, :44100]
-            tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-            torchaudio.save(tmp.name, prompt_wave.squeeze(0), 44100)
-            audio_with = dia_gen.generate(text=last_batch['raw_text'], audio_prompt_path=tmp.name)
-        os.unlink(tmp.name)
-        writer.add_audio('Eval/no_prompt', audio_no, global_step, 44100)
-        writer.add_audio('Eval/with_prompt', audio_with, global_step, 44100)
+        if last_batch: # Ensure last_batch is not None
+            dia_gen = Dia(dia_cfg, device)
+            dia_gen.model, dia_gen.dac_model = model, dac_model
+            with autocast():
+                audio_no = dia_gen.generate(text=last_batch['raw_text'])
+                prompt_wave = last_batch['waveforms'][0][:, :, :44100]
+                tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                torchaudio.save(tmp.name, prompt_wave.squeeze(0), 44100)
+                audio_with = dia_gen.generate(text=last_batch['raw_text'], audio_prompt_path=tmp.name)
+            os.unlink(tmp.name)
+            writer.add_audio('Eval/no_prompt', audio_no, global_step, 44100)
+            writer.add_audio('Eval/with_prompt', audio_with, global_step, 44100)
     except Exception:
         logger.exception("Eval error")
 
@@ -306,15 +326,20 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, hf_dataset, train_cfg: 
     for epoch in range(train_cfg.epochs):
         for step, batch in enumerate(tqdm(train_loader, desc=f"E{epoch+1}")):
             global_step = epoch * len(train_loader) + step
+            
+            if not batch:
+                logger.warning(f"Skipping empty batch at global_step {global_step} in epoch {epoch+1}")
+                continue
+
             train_step(model, batch, dia_cfg, train_cfg, opt, sched, writer, global_step)
 
-            if step % train_cfg.eval_step == 0:
+            if global_step > 0 and global_step % train_cfg.eval_step == 0:
                 model.eval()
                 with torch.no_grad():
                     eval_step(model, val_loader, dia_cfg, dac_model, writer, global_step)
                 model.train()
 
-            if step % train_cfg.save_step == 0:
+            if global_step > 0 and global_step % train_cfg.save_step == 0:
                 ckpt = train_cfg.output_dir / f"ckpt_step{global_step}.pth"
                 torch.save(model.state_dict(), ckpt)
                 logger.info(f"Saved checkpoint: {ckpt}")
