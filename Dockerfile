@@ -18,8 +18,11 @@ RUN groupadd --gid $USER_GID $USERNAME \
 USER $USERNAME
 WORKDIR /home/$USERNAME/app
 
-RUN python -m pip install --user --upgrade pip
+RUN python -m pip install --user --upgrade pip && pip install transformers datasets pydantic descript-audio-codec bitsandbytes
+
 
 ENV PATH="/home/$USERNAME/.local/bin:${PATH}"
+
+WORKDIR /mnt
 
 CMD ["bash"]

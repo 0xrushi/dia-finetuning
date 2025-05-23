@@ -227,7 +227,7 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
     return opt, sched
 
 
-def train_step(model, batch, dia_cfg, train_cfg, opt, sched, writer, global_step):
+def train_step(model, batch, dia_cfg, dac_model: dac.DAC, train_cfg, opt, sched, writer, global_step):
     """
     Perform a single training step: forward, loss, backward, update, log.
     """
@@ -251,11 +251,26 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, writer, global_step
             target.reshape(-1),
             ignore_index=dia_cfg.data.audio_pad_value
         )
+    writer.add_text('Prompt/train', batch['raw_text'], global_step)
     loss.backward()
     opt.step()
     sched.step()
     opt.zero_grad()
     writer.add_scalar('Loss/train', loss.item(), global_step)
+
+    # Generate and log audio every 10 steps
+    if global_step > 0 and global_step % 10 == 0:
+        model.eval()
+        with torch.no_grad():
+            try:
+                dia_gen = Dia(dia_cfg, device)
+                dia_gen.model, dia_gen.dac_model = model, dac_model
+                with autocast():
+                    generated_audio = dia_gen.generate(text=batch['raw_text'])
+                writer.add_audio(f'Audio/train_step_{global_step}', generated_audio, global_step, sample_rate=44100)
+            except Exception as e:
+                logger.error(f"Error during audio generation in train_step: {e}")
+        model.train()
 
 
 def eval_step(model, val_loader, dia_cfg, dac_model, writer, global_step):
@@ -319,6 +334,20 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, hf_dataset, train_cfg: 
     (train_cfg.runs_dir / train_cfg.run_name).mkdir(parents=True, exist_ok=True)
     model = model.to(device)
     train_loader, val_loader = setup_loaders(hf_dataset, dia_cfg, train_cfg)
+
+    # Log training configuration and step counts
+    num_train_samples = len(train_loader.dataset)
+    batch_size = train_loader.batch_size # Assuming train_loader has batch_size attribute
+    steps_per_epoch = len(train_loader)
+    total_train_steps = steps_per_epoch * train_cfg.epochs
+    logger.info("Starting training with the following configuration:")
+    logger.info(f"  Total training samples: {num_train_samples}")
+    logger.info(f"  Batch size: {batch_size}")
+    logger.info(f"  Steps per epoch: {steps_per_epoch}")
+    logger.info(f"  Number of epochs: {train_cfg.epochs}")
+    logger.info(f"  Total training steps: {total_train_steps}")
+    logger.info(f"  Audio will be logged every 10 training steps.")
+
     opt, sched = setup_optimizer_and_scheduler(model, train_loader, train_cfg)
     writer = SummaryWriter(train_cfg.runs_dir / train_cfg.run_name)
     model.train()
@@ -331,7 +360,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, hf_dataset, train_cfg: 
                 logger.warning(f"Skipping empty batch at global_step {global_step} in epoch {epoch+1}")
                 continue
 
-            train_step(model, batch, dia_cfg, train_cfg, opt, sched, writer, global_step)
+            train_step(model, batch, dia_cfg, dac_model, train_cfg, opt, sched, writer, global_step)
 
             if global_step > 0 and global_step % train_cfg.eval_step == 0:
                 model.eval()
