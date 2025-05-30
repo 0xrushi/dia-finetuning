@@ -27,6 +27,251 @@ def _str_to_dtype(dtype_str: str) -> torch.dtype | None:
         raise ValueError(f"Unsupported dtype string: {dtype_str}")
 
 
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+from typing import Any, Dict, Optional
+import math
+
+# First, let's create a LoRA-compatible version of DenseGeneral
+class LoRADenseGeneral(nn.Module):
+    """
+    LoRA-compatible version of DenseGeneral that can work with PEFT.
+    """
+    
+    def __init__(
+        self,
+        in_shapes: tuple[int, ...],
+        out_features: tuple[int, ...],
+        axis: tuple[int, ...] = (-1,),
+        dtype: torch.dtype | None = None,
+        weight_dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.in_shapes = in_shapes
+        self.out_features = out_features
+        self.axis = axis
+        self.dtype = dtype
+        self.kernel_shape = self.in_shapes + self.out_features
+
+        factory_kwargs = {"device": device, "dtype": weight_dtype}
+        self.weight = nn.Parameter(torch.empty(self.kernel_shape, **factory_kwargs))
+        self.register_parameter("bias", None)
+        
+        # Initialize weights
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        # Use Xavier uniform initialization
+        nn.init.xavier_uniform_(self.weight)
+    
+    @property 
+    def in_features(self):
+        """Compatibility property for LoRA - return input size"""
+        return int(torch.prod(torch.tensor(self.in_shapes)))
+    
+    @property
+    def out_features_size(self):
+        """Return output size"""
+        return int(torch.prod(torch.tensor(self.out_features)))
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        def _normalize_axes(axes: tuple[int, ...], ndim: int) -> tuple[int, ...]:
+            return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
+            
+        norm_axis = _normalize_axes(self.axis, inputs.ndim)
+        kernel_contract_axes = tuple(range(len(norm_axis)))
+
+        output = torch.tensordot(
+            inputs.float(),
+            self.weight.float(),
+            dims=(norm_axis, kernel_contract_axes),
+        ).to(inputs.dtype)
+        return output
+
+
+# Now let's create a custom LoRA layer for DenseGeneral
+from peft.tuners.lora.layer import LoraLayer
+from peft.utils import transpose
+
+class LoRADenseGeneralLayer(nn.Module, LoraLayer):
+    """
+    LoRA implementation for DenseGeneral layers.
+    """
+    
+    def __init__(self, base_layer: LoRADenseGeneral, adapter_name: str, **kwargs):
+        super().__init__()
+        LoraLayer.__init__(self, base_layer)
+        
+        # Store the base layer
+        self.base_layer = base_layer
+        
+        # Initialize LoRA parameters
+        self.update_layer(adapter_name, **kwargs)
+        
+    def update_layer(self, adapter_name: str, r: int, lora_alpha: int, lora_dropout: float, init_lora_weights: bool, **kwargs):
+        """Update the layer with LoRA parameters."""
+        if r <= 0:
+            raise ValueError(f"r must be positive, got {r}")
+            
+        self.r[adapter_name] = r
+        self.lora_alpha[adapter_name] = lora_alpha
+        
+        if lora_dropout > 0.0:
+            lora_dropout_layer = nn.Dropout(p=lora_dropout)
+        else:
+            lora_dropout_layer = nn.Identity()
+        self.lora_dropout[adapter_name] = lora_dropout_layer
+        
+        # Create LoRA A and B matrices
+        # For DenseGeneral, we need to handle the multi-dimensional weight tensor
+        base_weight = self.base_layer.weight
+        weight_shape = base_weight.shape
+        
+        # Flatten the weight to 2D for LoRA computation
+        in_features = int(torch.prod(torch.tensor(weight_shape[:-1])))
+        out_features = weight_shape[-1]
+        
+        # Create LoRA matrices
+        self.lora_A[adapter_name] = nn.Parameter(torch.zeros((r, in_features)))
+        self.lora_B[adapter_name] = nn.Parameter(torch.zeros((out_features, r)))
+        
+        # Initialize LoRA weights
+        if init_lora_weights:
+            self.reset_lora_parameters(adapter_name)
+            
+        # Set scaling factor
+        self.scaling[adapter_name] = lora_alpha / r
+        
+    def reset_lora_parameters(self, adapter_name: str):
+        """Reset LoRA parameters."""
+        if adapter_name in self.lora_A:
+            # Initialize A with random values, B with zeros (standard LoRA initialization)
+            nn.init.kaiming_uniform_(self.lora_A[adapter_name], a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B[adapter_name])
+    
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        previous_dtype = x.dtype
+        
+        # Get base output
+        result = self.base_layer(x)
+        
+        # Apply LoRA adaptations
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.lora_A:
+                continue
+                
+            lora_A = self.lora_A[active_adapter]
+            lora_B = self.lora_B[active_adapter]
+            dropout = self.lora_dropout[active_adapter]
+            scaling = self.scaling[active_adapter]
+            
+            # Flatten input for LoRA computation
+            x_flat = x.view(-1, lora_A.shape[1])
+            
+            # Compute LoRA output: (x @ A.T @ B.T) * scaling
+            lora_out = dropout(x_flat) @ lora_A.T @ lora_B.T * scaling
+            
+            # Reshape back to match result shape
+            lora_out = lora_out.view(result.shape)
+            
+            # Add to base output
+            result = result + lora_out.to(result.dtype)
+            
+        return result.to(previous_dtype)
+
+
+# Registration function to make PEFT recognize DenseGeneral
+def register_dense_general_lora():
+    """Register DenseGeneral with PEFT's LoRA system."""
+    from peft.tuners.lora.model import LoraModel
+    
+    # Add DenseGeneral to the list of supported modules
+    def patched_create_new_module(self, lora_config, adapter_name, target, device_map=None, **kwargs):
+        # Handle our custom DenseGeneral case
+        if isinstance(target, (DenseGeneral, LoRADenseGeneral)):
+            # Convert DenseGeneral to LoRADenseGeneral if needed
+            if isinstance(target, DenseGeneral):
+                # Create a LoRADenseGeneral with same parameters
+                lora_target = LoRADenseGeneral(
+                    in_shapes=target.in_shapes,
+                    out_features=target.out_features,
+                    axis=target.axis,
+                    dtype=target.dtype,
+                    weight_dtype=target.weight.dtype,
+                    device=target.weight.device
+                )
+                # Copy weights
+                lora_target.weight.data = target.weight.data.clone()
+                target = lora_target
+            
+            # Create LoRA layer
+            new_module = LoRADenseGeneralLayer(target, adapter_name, **kwargs)
+            return new_module
+        else:
+            # Fall back to original method for other module types
+            return original_create_new_module(self, lora_config, adapter_name, target, device_map, **kwargs)
+    
+    # Store original method and patch
+    if not hasattr(LoraModel, '_original_create_new_module'):
+        LoraModel._original_create_new_module = LoraModel._create_new_module
+        original_create_new_module = LoraModel._original_create_new_module
+        LoraModel._create_new_module = patched_create_new_module
+
+
+# Alternative: Simpler approach - just use Linear layers
+def convert_dense_general_to_linear(model):
+    """
+    Convert all DenseGeneral modules to equivalent Linear modules.
+    This is simpler and will work directly with existing LoRA.
+    """
+    def replace_dense_general(module):
+        for name, child in module.named_children():
+            if isinstance(child, DenseGeneral):
+                # Convert DenseGeneral to Linear
+                weight = child.weight
+                
+                # Flatten weight to 2D for Linear layer
+                in_features = int(torch.prod(torch.tensor(weight.shape[:-1])))
+                out_features = weight.shape[-1]
+                
+                # Create Linear layer
+                linear = nn.Linear(in_features, out_features, bias=False)
+                linear.weight.data = weight.view(out_features, in_features)
+                
+                # Replace the module
+                setattr(module, name, linear)
+            else:
+                replace_dense_general(child)
+    
+    replace_dense_general(model)
+    return model
+
+
+# Usage example for your training script
+def setup_lora_with_dense_general(model, train_cfg):
+    """
+    Setup LoRA with DenseGeneral support.
+    Choose between two approaches:
+    1. Register DenseGeneral with LoRA (more complex)
+    2. Convert DenseGeneral to Linear (simpler)
+    """
+    
+    # Approach 1: Register DenseGeneral (experimental)
+    if False:  # Set to True to try this approach
+        register_dense_general_lora()
+        # Continue with normal LoRA setup...
+        
+    # Approach 2: Convert to Linear (recommended)
+    else:
+        print("Converting DenseGeneral modules to Linear for LoRA compatibility...")
+        model = convert_dense_general_to_linear(model)
+        print("Conversion complete!")
+    
+    return model
+
 class DenseGeneral(nn.Module):
     """
     PyTorch equivalent of flax.linen.DenseGeneral with shapes defined at init.
